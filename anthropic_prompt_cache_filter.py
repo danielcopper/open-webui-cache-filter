@@ -1,9 +1,9 @@
 """
-title: Anthropic Prompt Cache Filter
-description: Adds cache_control to tools, system and last user message for Anthropic models
+title: Anthropic Prompt Cache
 author: daniel
 version: 0.2.0
 license: MIT
+description: Adds cache_control breakpoints to Anthropic/Claude requests for cost savings. Caches tools, system prompt, and last user message. Supports 5m and 1h TTL.
 """
 
 from pydantic import BaseModel, Field
