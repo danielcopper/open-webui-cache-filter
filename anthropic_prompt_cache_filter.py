@@ -9,6 +9,10 @@ description: Adds cache_control breakpoints to Anthropic/Claude requests for cos
 from pydantic import BaseModel, Field
 from typing import Optional, Callable, Awaitable
 import copy
+import logging
+
+log = logging.getLogger(__name__)
+log.setLevel(logging.DEBUG)
 
 
 class Filter:
@@ -174,11 +178,11 @@ class Filter:
         # Debug logging
         if self.valves.debug:
             import json
-            print(f"[Anthropic Cache] Model: {model}")
-            print(f"[Anthropic Cache] Breakpoints: {cache_points_added}")
+            log.info(f"[Anthropic Cache] Model: {model}")
+            log.info(f"[Anthropic Cache] Breakpoints: {cache_points_added}")
             if "tools" in body:
-                print(f"[Anthropic Cache] Tools: {json.dumps(body.get('tools', []), indent=2)}")
-            print(f"[Anthropic Cache] Messages: {json.dumps(body.get('messages', []), indent=2)}")
+                log.info(f"[Anthropic Cache] Tools: {json.dumps(body.get('tools', []), indent=2)}")
+            log.info(f"[Anthropic Cache] Messages: {json.dumps(body.get('messages', []), indent=2)}")
 
         return body
 
@@ -221,8 +225,8 @@ class Filter:
 
             # Debug logging
             if self.valves.debug:
-                print(f"[Anthropic Cache] Usage: {usage}")
-                print(f"[Anthropic Cache] Status: {status_msg}")
+                log.info(f"[Anthropic Cache] Usage: {usage}")
+                log.info(f"[Anthropic Cache] Status: {status_msg}")
 
             # Emit updated status if event_emitter available
             if self.valves.show_cache_status and __event_emitter__:
@@ -236,6 +240,6 @@ class Filter:
                     })
                 except Exception as e:
                     if self.valves.debug:
-                        print(f"[Anthropic Cache] Event emitter error in outlet: {e}")
+                        log.warning(f"[Anthropic Cache] Event emitter error in outlet: {e}")
 
         return body
