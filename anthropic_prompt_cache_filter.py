@@ -12,7 +12,6 @@ import copy
 import logging
 
 log = logging.getLogger(__name__)
-log.setLevel(logging.DEBUG)
 
 
 class Filter:
@@ -186,6 +185,44 @@ class Filter:
 
         return body
 
+    async def stream(
+        self,
+        event: dict,
+        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None
+    ) -> dict:
+        """
+        Intercept streaming chunks to catch usage data in final chunk.
+        Attempts to emit cache stats via __event_emitter__ (experimental).
+        """
+        if not self.valves.enabled or not self.valves.show_cache_status:
+            return event
+
+        # Check for final chunk with usage data
+        choices = event.get("choices", [])
+        if choices and choices[0].get("finish_reason") == "stop":
+            usage = event.get("usage")
+            if usage and __event_emitter__:
+                cache_read = usage.get("cache_read_input_tokens", 0)
+                cache_write = usage.get("cache_creation_input_tokens", 0)
+
+                if cache_read > 0:
+                    savings = int(cache_read * 0.9)
+                    status_msg = f"Cache HIT: {cache_read:,} tokens (saved ~{savings:,})"
+                elif cache_write > 0:
+                    status_msg = f"Cache WRITE: {cache_write:,} tokens"
+                else:
+                    return event
+
+                try:
+                    await __event_emitter__({
+                        "type": "status",
+                        "data": {"description": status_msg, "done": True}
+                    })
+                except Exception:
+                    pass  # Silently fail if event_emitter not available
+
+        return event
+
     async def outlet(
         self,
         body: dict,
@@ -193,20 +230,15 @@ class Filter:
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None
     ) -> dict:
         """
-        Analyze response for cache hit/miss statistics.
-        Note: __event_emitter__ might not be available in outlet depending on Open WebUI version.
+        Log cache hit/miss statistics for debugging.
+        Note: UI status updates are handled by stream() function.
         """
-        if not self.valves.enabled:
+        if not self.valves.enabled or not self.valves.debug:
             return body
 
         # Try to extract usage stats from response
-        # LiteLLM/Anthropic returns these in the response
-        usage = None
-
-        # Check various locations where usage might be
-        if "usage" in body:
-            usage = body["usage"]
-        elif "response" in body and isinstance(body["response"], dict):
+        usage = body.get("usage")
+        if not usage and "response" in body and isinstance(body["response"], dict):
             usage = body["response"].get("usage")
 
         if usage:
@@ -214,32 +246,12 @@ class Filter:
             cache_write = usage.get("cache_creation_input_tokens", 0)
             input_tokens = usage.get("input_tokens", 0)
 
-            # Calculate savings (cache reads are 90% cheaper)
             if cache_read > 0:
-                estimated_savings = int(cache_read * 0.9)
-                status_msg = f"Cache HIT: {cache_read:,} tokens (saved ~{estimated_savings:,})"
+                savings = int(cache_read * 0.9)
+                log.info(f"[Anthropic Cache] HIT: {cache_read:,} tokens (saved ~{savings:,})")
             elif cache_write > 0:
-                status_msg = f"Cache WRITE: {cache_write:,} tokens cached"
+                log.info(f"[Anthropic Cache] WRITE: {cache_write:,} tokens cached")
             else:
-                status_msg = f"No cache (input: {input_tokens:,} tokens)"
-
-            # Debug logging
-            if self.valves.debug:
-                log.info(f"[Anthropic Cache] Usage: {usage}")
-                log.info(f"[Anthropic Cache] Status: {status_msg}")
-
-            # Emit updated status if event_emitter available
-            if self.valves.show_cache_status and __event_emitter__:
-                try:
-                    await __event_emitter__({
-                        "type": "status",
-                        "data": {
-                            "description": status_msg,
-                            "done": True
-                        }
-                    })
-                except Exception as e:
-                    if self.valves.debug:
-                        log.warning(f"[Anthropic Cache] Event emitter error in outlet: {e}")
+                log.info(f"[Anthropic Cache] No cache (input: {input_tokens:,} tokens)")
 
         return body
