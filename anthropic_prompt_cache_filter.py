@@ -54,7 +54,9 @@ class Filter:
     def _is_anthropic_model(self, model: str) -> bool:
         """Check if model is Anthropic/Claude"""
         model_lower = model.lower()
-        return "claude" in model_lower or "anthropic" in model_lower
+        # Match: claude, anthropic, sonnet, opus, haiku (Anthropic model names)
+        anthropic_keywords = ["claude", "anthropic", "sonnet", "opus", "haiku"]
+        return any(kw in model_lower for kw in anthropic_keywords)
 
     def _get_cache_control(self) -> dict:
         """Get cache_control dict based on TTL setting"""
