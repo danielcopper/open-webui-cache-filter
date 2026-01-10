@@ -49,6 +49,7 @@ class Filter:
 
     def __init__(self):
         self.valves = self.Valves()
+        # Kein self.toggle - Filter läuft immer wenn er einem Model zugewiesen ist
 
     def _is_anthropic_model(self, model: str) -> bool:
         """Check if model is Anthropic/Claude"""
