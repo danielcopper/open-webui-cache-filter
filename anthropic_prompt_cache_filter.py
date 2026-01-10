@@ -1,15 +1,31 @@
 """
 title: Anthropic Prompt Cache
 author: daniel
-version: 0.2.0
+version: 0.8.2
 license: MIT
-description: Adds cache_control breakpoints to Anthropic/Claude requests for cost savings. Caches tools, system prompt, and last user message. Supports 5m and 1h TTL.
+description: Displays Anthropic prompt cache statistics (hit/miss, tokens saved, cost savings) in the chat UI.
+
+Requirements:
+- Open WebUI: ENABLE_FORWARD_USER_INFO_HEADERS=true (sends x-openwebui-chat-id header)
+- LiteLLM config:
+    extra_spend_tag_headers:
+      - "x-openwebui-chat-id"
+    cache_control_injection_points:
+      - location: message
+        role: system
+      - location: message
+        index: -1
+
+The filter queries LiteLLM spend logs to get cache statistics and displays them in the UI.
+Note: Actual cache_control injection is done by LiteLLM, not this filter.
 """
 
 from pydantic import BaseModel, Field
 from typing import Optional, Callable, Awaitable
+import asyncio
 import copy
 import logging
+from datetime import datetime, timedelta
 
 log = logging.getLogger(__name__)
 
@@ -49,9 +65,18 @@ class Filter:
             default=False,
             description="Log modified messages to console"
         )
+        litellm_url: str = Field(
+            default="http://litellm:4000",
+            description="LiteLLM proxy URL for querying spend logs"
+        )
+        litellm_api_key: str = Field(
+            default="",
+            description="LiteLLM master API key for spend logs access"
+        )
 
     def __init__(self):
         self.type = "filter"  # Required for Open WebUI to call inlet/outlet
+        self.citation = False  # Prevent Open WebUI from overriding our custom citations
         self.valves = self.Valves()
 
     def _is_anthropic_model(self, model: str) -> bool:
@@ -163,65 +188,11 @@ class Filter:
                     cache_points_added.append("User")
                     break
 
-        # Emit status event (inlet: show what we're caching)
-        if self.valves.show_cache_status and __event_emitter__ and cache_points_added:
-            points_str = " + ".join(cache_points_added)
-            await __event_emitter__({
-                "type": "status",
-                "data": {
-                    "description": f"Cache: {points_str} | TTL: {self.valves.cache_ttl}",
-                    "done": False
-                }
-            })
-
         # Debug logging
         if self.valves.debug:
-            import json
-            log.info(f"[Anthropic Cache] Model: {model}")
-            log.info(f"[Anthropic Cache] Breakpoints: {cache_points_added}")
-            if "tools" in body:
-                log.info(f"[Anthropic Cache] Tools: {json.dumps(body.get('tools', []), indent=2)}")
-            log.info(f"[Anthropic Cache] Messages: {json.dumps(body.get('messages', []), indent=2)}")
+            log.info(f"[Anthropic Cache] Model: {model}, Breakpoints: {cache_points_added}")
 
         return body
-
-    async def stream(
-        self,
-        event: dict,
-        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None
-    ) -> dict:
-        """
-        Intercept streaming chunks to catch usage data in final chunk.
-        Attempts to emit cache stats via __event_emitter__ (experimental).
-        """
-        if not self.valves.enabled or not self.valves.show_cache_status:
-            return event
-
-        # Check for final chunk with usage data
-        choices = event.get("choices", [])
-        if choices and choices[0].get("finish_reason") == "stop":
-            usage = event.get("usage")
-            if usage and __event_emitter__:
-                cache_read = usage.get("cache_read_input_tokens", 0)
-                cache_write = usage.get("cache_creation_input_tokens", 0)
-
-                if cache_read > 0:
-                    savings = int(cache_read * 0.9)
-                    status_msg = f"Cache HIT: {cache_read:,} tokens (saved ~{savings:,})"
-                elif cache_write > 0:
-                    status_msg = f"Cache WRITE: {cache_write:,} tokens"
-                else:
-                    return event
-
-                try:
-                    await __event_emitter__({
-                        "type": "status",
-                        "data": {"description": status_msg, "done": True}
-                    })
-                except Exception:
-                    pass  # Silently fail if event_emitter not available
-
-        return event
 
     async def outlet(
         self,
@@ -230,28 +201,163 @@ class Filter:
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None
     ) -> dict:
         """
-        Log cache hit/miss statistics for debugging.
-        Note: UI status updates are handled by stream() function.
+        Query LiteLLM spend logs for cache statistics and display in UI.
         """
-        if not self.valves.enabled or not self.valves.debug:
+        if not self.valves.enabled:
             return body
 
-        # Try to extract usage stats from response
-        usage = body.get("usage")
-        if not usage and "response" in body and isinstance(body["response"], dict):
-            usage = body["response"].get("usage")
+        # Need API key to query spend logs
+        if not self.valves.litellm_api_key:
+            if self.valves.debug:
+                log.info("[Anthropic Cache] No LiteLLM API key configured, skipping cache stats")
+            return body
 
-        if usage:
+        # Get user ID and chat_id for filtering
+        user_id = __user__.get("id") if __user__ else None
+        chat_id = body.get("chat_id")
+
+        if self.valves.debug:
+            log.info(f"[Anthropic Cache] OUTLET chat_id: {chat_id}")
+
+        if not user_id:
+            return body
+
+        try:
+            import aiohttp
+
+            # Wait for spend logs to be written (async delay in LiteLLM)
+            await asyncio.sleep(2)
+
+            # Query spend logs for today
+            today = datetime.utcnow().strftime("%Y-%m-%d")
+            tomorrow = (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+            url = f"{self.valves.litellm_url}/spend/logs"
+            params = {
+                "start_date": today,
+                "end_date": tomorrow,
+                "summarize": "false"
+            }
+            headers = {
+                "Authorization": f"Bearer {self.valves.litellm_api_key}"
+            }
+
+            # Retry logic - spend logs may not be written immediately
+            latest = None
+            chat_id_tag = f"x-openwebui-chat-id: {chat_id}" if chat_id else None
+
+            for attempt in range(3):
+                async with aiohttp.ClientSession() as http_session:
+                    async with http_session.get(url, params=params, headers=headers, timeout=5) as response:
+                        if response.status != 200:
+                            if self.valves.debug:
+                                log.warning(f"[Anthropic Cache] LiteLLM API error: {response.status}")
+                            return body
+                        logs = await response.json()
+
+                # Filter by chat_id tag (exact match) or fall back to user_id
+                matching_logs = []
+                for entry in logs:
+                    if entry.get("user") != user_id:
+                        continue
+                    # Prefer exact chat_id match via request_tags
+                    if chat_id_tag:
+                        tags = entry.get("request_tags", [])
+                        if chat_id_tag not in tags:
+                            continue
+                    matching_logs.append(entry)
+
+                if matching_logs:
+                    # ─────────────────────────────────────────────────────────────
+                    # Heuristic to distinguish Main Response from Title Generation
+                    # ─────────────────────────────────────────────────────────────
+                    # Open WebUI makes parallel requests for each user message:
+                    # 1. Main completion (answer to user) - more tokens, has cache hits
+                    # 2. Title generation (chat title) - few tokens (~20-100), no cache hits
+                    #
+                    # Both have the same chat_id, so we need to identify the main response:
+                    # - If cache_read > 0: definitely main response (title gen uses different prompt)
+                    # - If cache_read = 0: take highest total_tokens (main > title gen)
+                    #
+                    # This works because:
+                    # - Title gen has short output (~20 tokens for a title)
+                    # - Main responses have more tokens (even short answers > title)
+                    # - After cache expires, we still get the right entry via token count
+                    # ─────────────────────────────────────────────────────────────
+
+                    # Sort by endTime descending, take recent entries for this chat
+                    matching_logs.sort(key=lambda x: x.get("endTime", ""), reverse=True)
+                    recent_logs = matching_logs[:10]
+
+                    # Priority 1: Entry with cache_read > 0 (definitely main response)
+                    for entry in recent_logs:
+                        usage = entry.get("metadata", {}).get("usage_object", {})
+                        if (usage.get("cache_read_input_tokens", 0) or 0) > 0:
+                            latest = entry
+                            break
+
+                    # Priority 2: Entry with highest total_tokens (main response > title gen)
+                    if not latest:
+                        latest = max(recent_logs, key=lambda x: x.get("total_tokens", 0))
+
+                    break
+
+                # Wait before retry
+                if attempt < 2:
+                    await asyncio.sleep(1)
+
+            if not latest:
+                if self.valves.debug:
+                    log.info(f"[Anthropic Cache] No logs found for chat_id {chat_id}")
+                return body
+
+            # Extract cache stats
+            usage = latest.get("metadata", {}).get("usage_object", {})
             cache_read = usage.get("cache_read_input_tokens", 0)
             cache_write = usage.get("cache_creation_input_tokens", 0)
-            input_tokens = usage.get("input_tokens", 0)
 
-            if cache_read > 0:
-                savings = int(cache_read * 0.9)
-                log.info(f"[Anthropic Cache] HIT: {cache_read:,} tokens (saved ~{savings:,})")
-            elif cache_write > 0:
-                log.info(f"[Anthropic Cache] WRITE: {cache_write:,} tokens cached")
-            else:
-                log.info(f"[Anthropic Cache] No cache (input: {input_tokens:,} tokens)")
+            if self.valves.debug:
+                log.info(f"[Anthropic Cache] Matched: tokens={latest.get('total_tokens')}, cache_read={cache_read}, cache_write={cache_write}")
+
+            # Emit cache status
+            if self.valves.show_cache_status and __event_emitter__:
+                if cache_read > 0:
+                    # Cache HIT - calculate money saved using actual model pricing
+                    model_info = latest.get("metadata", {}).get("model_map_information", {}).get("model_map_value", {})
+                    input_cost = model_info.get("input_cost_per_token", 0) or 0
+                    cache_read_cost = model_info.get("cache_read_input_token_cost", 0) or 0
+
+                    if input_cost > 0 and cache_read_cost > 0:
+                        saved_dollars = cache_read * (input_cost - cache_read_cost)
+                        if saved_dollars >= 0.01:
+                            status_msg = f"Cache hit: {cache_read:,} (-${saved_dollars:.2f})"
+                        else:
+                            status_msg = f"Cache hit: {cache_read:,}"
+                    else:
+                        status_msg = f"Cache hit: {cache_read:,}"
+
+                elif cache_write > 0:
+                    # Cache WRITE - show tokens cached with TTL
+                    status_msg = f"Cached: {cache_write:,} tokens (5m)"
+
+                else:
+                    # No cache activity
+                    status_msg = "Cache expired"
+
+                # Status at top (replaces "Cache active" from inlet)
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {
+                        "description": status_msg,
+                        "done": True
+                    }
+                })
+
+        except ImportError:
+            if self.valves.debug:
+                log.warning("[Anthropic Cache] aiohttp not available")
+        except Exception as e:
+            if self.valves.debug:
+                log.warning(f"[Anthropic Cache] Error querying spend logs: {e}")
 
         return body
