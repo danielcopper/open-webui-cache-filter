@@ -1,23 +1,25 @@
 """
-title: Anthropic Prompt Cache
+title: Prompt Cache Stats
 author: daniel
-version: 0.8.2
+version: 1.0.0
 license: MIT
-description: Displays Anthropic prompt cache statistics (hit/miss, tokens saved, cost savings) in the chat UI.
+description: Displays prompt cache statistics (hit/miss, tokens saved, cost savings) for Anthropic and OpenAI.
+
+Supported:
+- Anthropic: 90% discount, manual cache_control via LiteLLM
+- OpenAI: 50% discount, automatic caching (no config needed)
 
 Requirements:
-- Open WebUI: ENABLE_FORWARD_USER_INFO_HEADERS=true (sends x-openwebui-chat-id header)
+- Open WebUI: ENABLE_FORWARD_USER_INFO_HEADERS=true
 - LiteLLM config:
     extra_spend_tag_headers:
       - "x-openwebui-chat-id"
+    # For Anthropic only:
     cache_control_injection_points:
       - location: message
         role: system
       - location: message
         index: -1
-
-The filter queries LiteLLM spend logs to get cache statistics and displays them in the UI.
-Note: Actual cache_control injection is done by LiteLLM, not this filter.
 """
 
 from pydantic import BaseModel, Field
@@ -42,20 +44,20 @@ class Filter:
         )
         cache_ttl: str = Field(
             default="5m",
-            description="Cache TTL: '5m' (default, 1.25x write cost) or '1h' (2x write cost)",
+            description="[Anthropic only] Cache TTL: '5m' (1.25x write) or '1h' (2x write)",
             json_schema_extra={"enum": ["5m", "1h"]}
         )
         cache_tools: bool = Field(
             default=True,
-            description="Add cache_control to tools (Function Calling)"
+            description="[Anthropic only] Add cache_control to tools"
         )
         cache_system: bool = Field(
             default=True,
-            description="Add cache_control to system message"
+            description="[Anthropic only] Add cache_control to system message"
         )
         cache_last_user: bool = Field(
             default=True,
-            description="Add cache_control to last user message (incremental caching)"
+            description="[Anthropic only] Add cache_control to last user message"
         )
         show_cache_status: bool = Field(
             default=True,
@@ -79,12 +81,20 @@ class Filter:
         self.citation = False  # Prevent Open WebUI from overriding our custom citations
         self.valves = self.Valves()
 
-    def _is_anthropic_model(self, model: str) -> bool:
-        """Check if model is Anthropic/Claude"""
+    def _get_provider(self, model: str) -> str | None:
+        """Get provider from model name"""
         model_lower = model.lower()
-        # Match: claude, anthropic, sonnet, opus, haiku (Anthropic model names)
-        anthropic_keywords = ["claude", "anthropic", "sonnet", "opus", "haiku"]
-        return any(kw in model_lower for kw in anthropic_keywords)
+        # Anthropic
+        if model_lower.startswith("anthropic/"):
+            return "anthropic"
+        if any(kw in model_lower for kw in ["claude", "sonnet", "opus", "haiku"]):
+            return "anthropic"
+        # OpenAI
+        if model_lower.startswith("openai/"):
+            return "openai"
+        if any(kw in model_lower for kw in ["gpt-", "gpt_"]):
+            return "openai"
+        return None
 
     def _get_cache_control(self) -> dict:
         """Get cache_control dict based on TTL setting"""
@@ -146,51 +156,57 @@ class Filter:
         if not self.valves.enabled:
             return body
 
-        # Check if Anthropic model
+        # Get provider from model name
         model = body.get("model", "")
-        if not self._is_anthropic_model(model):
+        provider = self._get_provider(model)
+        if not provider:
             return body
 
         cache_points_added = []
-        cache_control = self._get_cache_control()
 
-        # Clean existing cache_control from messages
-        if "messages" in body:
-            body["messages"] = self._remove_existing_cache_control(body["messages"])
+        # Anthropic: Manual cache_control injection
+        if provider == "anthropic":
+            cache_control = self._get_cache_control()
 
-        # Clean existing cache_control from tools
-        if "tools" in body and body["tools"]:
-            body["tools"] = self._remove_cache_control_from_tools(body["tools"])
+            # Clean existing cache_control from messages
+            if "messages" in body:
+                body["messages"] = self._remove_existing_cache_control(body["messages"])
 
-        # Cache Hierarchy (Anthropic order): tools -> system -> messages
-        # Max 4 breakpoints total
+            # Clean existing cache_control from tools
+            if "tools" in body and body["tools"]:
+                body["tools"] = self._remove_cache_control_from_tools(body["tools"])
 
-        # 1. Cache tools (last tool gets cache_control)
-        if self.valves.cache_tools and "tools" in body and body["tools"]:
-            body["tools"][-1]["cache_control"] = cache_control
-            cache_points_added.append("Tools")
+            # Cache Hierarchy (Anthropic order): tools -> system -> messages
+            # Max 4 breakpoints total
 
-        # 2. Cache system message
-        if self.valves.cache_system and "messages" in body:
-            for i, msg in enumerate(body["messages"]):
-                if msg.get("role") == "system":
-                    body["messages"][i]["content"] = self._add_cache_to_content(msg["content"])
-                    cache_points_added.append("System")
-                    break
+            # 1. Cache tools (last tool gets cache_control)
+            if self.valves.cache_tools and "tools" in body and body["tools"]:
+                body["tools"][-1]["cache_control"] = cache_control
+                cache_points_added.append("Tools")
 
-        # 3. Cache last user message (for incremental conversation caching)
-        if self.valves.cache_last_user and "messages" in body:
-            for i in range(len(body["messages"]) - 1, -1, -1):
-                if body["messages"][i].get("role") == "user":
-                    body["messages"][i]["content"] = self._add_cache_to_content(
-                        body["messages"][i]["content"]
-                    )
-                    cache_points_added.append("User")
-                    break
+            # 2. Cache system message
+            if self.valves.cache_system and "messages" in body:
+                for i, msg in enumerate(body["messages"]):
+                    if msg.get("role") == "system":
+                        body["messages"][i]["content"] = self._add_cache_to_content(msg["content"])
+                        cache_points_added.append("System")
+                        break
+
+            # 3. Cache last user message (for incremental conversation caching)
+            if self.valves.cache_last_user and "messages" in body:
+                for i in range(len(body["messages"]) - 1, -1, -1):
+                    if body["messages"][i].get("role") == "user":
+                        body["messages"][i]["content"] = self._add_cache_to_content(
+                            body["messages"][i]["content"]
+                        )
+                        cache_points_added.append("User")
+                        break
+
+        # OpenAI: Caching is automatic, no injection needed
 
         # Debug logging
         if self.valves.debug:
-            log.info(f"[Anthropic Cache] Model: {model}, Breakpoints: {cache_points_added}")
+            log.info(f"[Cache] {provider}: Model={model}, Breakpoints={cache_points_added}")
 
         return body
 
@@ -206,10 +222,16 @@ class Filter:
         if not self.valves.enabled:
             return body
 
+        # Get provider from model name
+        model = body.get("model", "")
+        provider = self._get_provider(model)
+        if not provider:
+            return body
+
         # Need API key to query spend logs
         if not self.valves.litellm_api_key:
             if self.valves.debug:
-                log.info("[Anthropic Cache] No LiteLLM API key configured, skipping cache stats")
+                log.info("[Cache] No LiteLLM API key configured, skipping cache stats")
             return body
 
         # Get user ID and chat_id for filtering
@@ -217,7 +239,7 @@ class Filter:
         chat_id = body.get("chat_id")
 
         if self.valves.debug:
-            log.info(f"[Anthropic Cache] OUTLET chat_id: {chat_id}")
+            log.info(f"[Cache] OUTLET provider={provider}, chat_id={chat_id}")
 
         if not user_id:
             return body
@@ -289,10 +311,15 @@ class Filter:
                     matching_logs.sort(key=lambda x: x.get("endTime", ""), reverse=True)
                     recent_logs = matching_logs[:10]
 
-                    # Priority 1: Entry with cache_read > 0 (definitely main response)
+                    # Priority 1: Entry with cache activity (definitely main response)
                     for entry in recent_logs:
                         usage = entry.get("metadata", {}).get("usage_object", {})
-                        if (usage.get("cache_read_input_tokens", 0) or 0) > 0:
+                        # Anthropic: cache_read_input_tokens
+                        # OpenAI: prompt_tokens_details.cached_tokens
+                        anthropic_cache = (usage.get("cache_read_input_tokens", 0) or 0) > 0
+                        prompt_details = usage.get("prompt_tokens_details", {}) or {}
+                        openai_cache = (prompt_details.get("cached_tokens", 0) or 0) > 0
+                        if anthropic_cache or openai_cache:
                             latest = entry
                             break
 
@@ -308,43 +335,62 @@ class Filter:
 
             if not latest:
                 if self.valves.debug:
-                    log.info(f"[Anthropic Cache] No logs found for chat_id {chat_id}")
+                    log.info(f"[Cache] No logs found for chat_id {chat_id}")
                 return body
 
-            # Extract cache stats
+            # Extract cache stats based on provider
             usage = latest.get("metadata", {}).get("usage_object", {})
-            cache_read = usage.get("cache_read_input_tokens", 0)
-            cache_write = usage.get("cache_creation_input_tokens", 0)
+
+            if provider == "openai":
+                # OpenAI: prompt_tokens_details.cached_tokens
+                prompt_details = usage.get("prompt_tokens_details", {}) or {}
+                cache_read = prompt_details.get("cached_tokens", 0) or 0
+                cache_write = 0  # OpenAI doesn't report cache writes
+            else:
+                # Anthropic: cache_read_input_tokens, cache_creation_input_tokens
+                cache_read = usage.get("cache_read_input_tokens", 0) or 0
+                cache_write = usage.get("cache_creation_input_tokens", 0) or 0
 
             if self.valves.debug:
-                log.info(f"[Anthropic Cache] Matched: tokens={latest.get('total_tokens')}, cache_read={cache_read}, cache_write={cache_write}")
+                log.info(f"[Cache] {provider}: tokens={latest.get('total_tokens')}, cache_read={cache_read}, cache_write={cache_write}")
 
             # Emit cache status
             if self.valves.show_cache_status and __event_emitter__:
                 if cache_read > 0:
-                    # Cache HIT - calculate money saved using actual model pricing
+                    # Cache HIT - calculate money saved
                     model_info = latest.get("metadata", {}).get("model_map_information", {}).get("model_map_value", {})
                     input_cost = model_info.get("input_cost_per_token", 0) or 0
-                    cache_read_cost = model_info.get("cache_read_input_token_cost", 0) or 0
 
-                    if input_cost > 0 and cache_read_cost > 0:
-                        saved_dollars = cache_read * (input_cost - cache_read_cost)
-                        if saved_dollars >= 0.01:
-                            status_msg = f"Cache hit: {cache_read:,} (-${saved_dollars:.2f})"
+                    if provider == "openai":
+                        # OpenAI: 50% discount on cached tokens
+                        if input_cost > 0:
+                            saved_dollars = cache_read * input_cost * 0.5
+                            if saved_dollars >= 0.01:
+                                status_msg = f"Cache hit: {cache_read:,} (-${saved_dollars:.2f})"
+                            else:
+                                status_msg = f"Cache hit: {cache_read:,}"
                         else:
                             status_msg = f"Cache hit: {cache_read:,}"
                     else:
-                        status_msg = f"Cache hit: {cache_read:,}"
+                        # Anthropic: use actual cache_read_cost from model info
+                        cache_read_cost = model_info.get("cache_read_input_token_cost", 0) or 0
+                        if input_cost > 0 and cache_read_cost > 0:
+                            saved_dollars = cache_read * (input_cost - cache_read_cost)
+                            if saved_dollars >= 0.01:
+                                status_msg = f"Cache hit: {cache_read:,} (-${saved_dollars:.2f})"
+                            else:
+                                status_msg = f"Cache hit: {cache_read:,}"
+                        else:
+                            status_msg = f"Cache hit: {cache_read:,}"
 
                 elif cache_write > 0:
-                    # Cache WRITE - show tokens cached with TTL
+                    # Cache WRITE (Anthropic only)
                     status_msg = f"Cached: {cache_write:,} tokens (5m)"
 
                 else:
                     # No cache activity
                     status_msg = "Cache expired"
 
-                # Status at top (replaces "Cache active" from inlet)
                 await __event_emitter__({
                     "type": "status",
                     "data": {
@@ -355,9 +401,9 @@ class Filter:
 
         except ImportError:
             if self.valves.debug:
-                log.warning("[Anthropic Cache] aiohttp not available")
+                log.warning("[Cache] aiohttp not available")
         except Exception as e:
             if self.valves.debug:
-                log.warning(f"[Anthropic Cache] Error querying spend logs: {e}")
+                log.warning(f"[Cache] Error querying spend logs: {e}")
 
         return body
