@@ -1,7 +1,7 @@
 """
 title: Prompt Cache Stats
 author: daniel
-version: 1.0.0
+version: 1.0.1
 license: MIT
 description: Displays prompt cache statistics (hit/miss, tokens saved, cost savings) for Anthropic and OpenAI.
 
@@ -247,6 +247,19 @@ class Filter:
         try:
             import aiohttp
 
+            # Show loading indicator while waiting for spend logs
+            if self.valves.show_cache_status and __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {
+                        "description": "Checking cache...",
+                        "done": False
+                    }
+                })
+
+            # Record start time to filter out old log entries
+            outlet_start_time = datetime.utcnow()
+
             # Wait for spend logs to be written (async delay in LiteLLM)
             await asyncio.sleep(2)
 
@@ -307,12 +320,27 @@ class Filter:
                     # - After cache expires, we still get the right entry via token count
                     # ─────────────────────────────────────────────────────────────
 
-                    # Sort by endTime descending, take recent entries for this chat
-                    matching_logs.sort(key=lambda x: x.get("endTime", ""), reverse=True)
-                    recent_logs = matching_logs[:10]
+                    # Filter to entries from CURRENT request only (not old messages)
+                    # Use outlet_start_time minus small buffer for clock skew
+                    cutoff_time = (outlet_start_time - timedelta(seconds=5)).isoformat()
+                    current_entries = [
+                        entry for entry in matching_logs
+                        if entry.get("endTime", "") >= cutoff_time
+                    ]
 
-                    # Priority 1: Entry with cache activity (definitely main response)
-                    for entry in recent_logs:
+                    # If no fresh entries, retry (logs might not be written yet)
+                    if not current_entries:
+                        if attempt < 2:
+                            await asyncio.sleep(1)
+                            continue
+                        # Give up, use most recent entry as fallback
+                        current_entries = matching_logs[:1]
+
+                    # Sort by endTime descending (most recent first)
+                    current_entries.sort(key=lambda x: x.get("endTime", ""), reverse=True)
+
+                    # Among current entries, prefer one with cache activity (main response)
+                    for entry in current_entries:
                         usage = entry.get("metadata", {}).get("usage_object", {})
                         # Anthropic: cache_read_input_tokens
                         # OpenAI: prompt_tokens_details.cached_tokens
@@ -323,9 +351,9 @@ class Filter:
                             latest = entry
                             break
 
-                    # Priority 2: Entry with highest total_tokens (main response > title gen)
-                    if not latest:
-                        latest = max(recent_logs, key=lambda x: x.get("total_tokens", 0))
+                    # Fallback: highest token count among current entries
+                    if not latest and current_entries:
+                        latest = max(current_entries, key=lambda x: x.get("total_tokens", 0))
 
                     break
 
